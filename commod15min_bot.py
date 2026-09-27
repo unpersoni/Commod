@@ -1,13 +1,13 @@
 # ============================================================
 # Commod15min V25 — back to the 80/70 reversal strategy (parameter tuning
 # comes later). All V23/V24 speed fixes kept; order price limits still OFF.
-#   - Armed for the last 4 minutes of each market (TRIGGER_MIN = 4).
+#   - Armed for the last 3 minutes of each market (TRIGGER_MIN = 3).
 #   - Favorite = first side to reach 80c (ENTRY_C; 81-82c also buys via
 #     ENTRY_CAP_GRACE_C). Buy CONTRACTS (10).
 #   - Fixed stop: Favorite's bid <= 70c (STOP_C) -> one combined order
 #     buys 2x (20) of the opposite side: closes the 10 held + opens 10 new.
 #     Stop is live the whole time the Favorite is held (STOP_ACTIVATE_SEC
-#     = the full 4-min window), not just the last 90s as in V19-V24.
+#     = the full 3-min window), not just the last 90s as in V19-V24.
 #   - Reversal held to settlement. No second stop/reversal.
 #   - Settlement rows now label the 3 outcomes: settle_win (Favorite won),
 #     rev_settle_win (reversal won), rev_settle_loss (reversed, but the
@@ -293,8 +293,8 @@ SERIES = [
     "KXPALLADIUM15M",
 ]
 
-TRIGGER_MIN        = 4.0  # V25: armed for the last 4 minutes of each
-                           # 15-min market (i.e. from minute 11 on). Entry
+TRIGGER_MIN        = 3.0  # V25: armed for the last 3 minutes of each
+                           # 15-min market (i.e. from minute 12 on). Entry
                            # and stop both only happen inside this window.
 ENTRY_C            = 80   # V25: the Favorite = the first side whose price
                            # (its ask — what a buy actually pays) reaches
@@ -329,7 +329,7 @@ STOP_DEADBAND_SEC  = 2.0   # never fire a stop inside this many seconds
                             # instead, same as it always has.
 STOP_ACTIVATE_SEC  = TRIGGER_MIN * 60  # V25: stop is live the whole time
                             # the Favorite is held (entry and stop share the
-                            # same 4-min window). Was 90s in V19-V24:
+                            # same 3-min window). Was 90s in V19-V24:
                             # the stop-loss check doesn't arm until the
                             # window has this many seconds (or fewer) left
                             # to close — i.e. the stop is only "live"
