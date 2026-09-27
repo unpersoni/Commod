@@ -1,4 +1,18 @@
 # ============================================================
+# Commod15min V24 — two switches on top of V23:
+#   - USE_PRICE_LIMITS (default False): turns V23's order price limits
+#     off, so orders go out at 99c/1c exactly like V22 while every other
+#     V23 speed fix stays on (event-driven entries, no balance round trips,
+#     no wasted arm cycle, ask-based band, per-trade slippage/ms logging).
+#     That isolates how much of the 87-91c problem was reaction time alone.
+#     Flip to True to test the limits on top.
+#   - ENTRY_CAP_GRACE_C (default 2): an ask 1-2c over ENTRY_CAP_C still
+#     triggers the buy instead of being skipped, and (with limits on) the
+#     entry limit is no longer clamped at ENTRY_CAP_C — a missed trade over
+#     one cent is worse than paying that cent.
+#   An entry that doesn't fill (FOK killed) now goes back to armed and
+#   retries on the next tick (V22 gave up on the market for the window).
+#
 # Commod15min V23 — ORDER PRICE ACCURACY / LATENCY. Fills were landing
 # 7-11c past the target (e.g. 87-91c on an 80c trigger). Causes, and
 # what changed for each:
@@ -332,14 +346,27 @@ STOP_ACTIVATE_SEC  = 90.0  # the stop-loss check doesn't arm until the
                             # mean-revert before they'd matter anyway;
                             # this concentrates the stop on the stretch
                             # that's actually close to decisive.
-MAX_ENTRY_SLIPPAGE_C = 2   # V23: an entry order pays at most this many
-                            # cents above the ask seen when the trigger
-                            # fired (and never above ENTRY_CAP_C). If the
+USE_PRICE_LIMITS     = False  # V24: master switch for the order price
+                            # limits below. False = orders go out exactly
+                            # like V22 (99c buy / 1c sell — always fills
+                            # if there are contracts at any price), with
+                            # every OTHER V23 speed fix still on. Use this
+                            # to measure how much the speed fixes alone
+                            # close the gap, then flip to True to add the
+                            # limits on top.
+ENTRY_CAP_GRACE_C    = 2   # V24: an ask up to this many cents ABOVE
+                            # ENTRY_CAP_C still triggers the buy, so a
+                            # market that ticks 1-2c past the cap between
+                            # updates isn't a missed trade. 0 = hard cap.
+MAX_ENTRY_SLIPPAGE_C = 2   # V23 (only when USE_PRICE_LIMITS): an entry
+                            # order pays at most this many cents above the
+                            # ask seen when the trigger fired. If the
                             # book can't fill all CONTRACTS inside that,
                             # the FOK is killed and the bot retries on the
                             # next tick. 0 = only ever fill at the exact
                             # price seen.
-MAX_STOP_SLIPPAGE_C  = 2   # V23: a stop/reversal order accepts at most
+MAX_STOP_SLIPPAGE_C  = 2   # V23 (only when USE_PRICE_LIMITS): a
+                            # stop/reversal order accepts at most
                             # this many cents worse than the bid seen when
                             # the stop fired. If price gaps past that
                             # before the order lands, the FOK is killed
@@ -601,7 +628,8 @@ def place_order(sess, k, ticker, action, yes_side, count, limit_c=None):
     TRADED: for a buy, the most we'll pay for that side; for a sell, the
     least we'll accept for it. (NO-side limits are converted to the YES
     book here: buying NO at <=L is selling YES at >=100-L, etc.)
-    V23: limit_c=None used to be the only mode — a 99c buy / 1c sell,
+    V23: limit_c=None (also what every call gets when USE_PRICE_LIMITS
+    is False) used to be the only mode — a 99c buy / 1c sell,
     i.e. a market order that walked the book whenever the top level
     didn't have the full count. Every trading call site now passes a
     real limit; None is kept only for the 1-contract test cell.
@@ -610,6 +638,8 @@ def place_order(sess, k, ticker, action, yes_side, count, limit_c=None):
     Orders always go through REST — Kalshi's WebSocket API is market-data
     only, there is no order-placement channel.
     """
+    if not USE_PRICE_LIMITS:
+        limit_c = None
     if limit_c is None:
         limit_c = 99 if action == "buy" else 1
     limit_c = max(1, min(99, int(round(limit_c))))
@@ -1011,7 +1041,7 @@ def start_feed(k):
 
 def main():
     global FEED, SPOT
-    print("Commod15min V23 — starting")
+    print("Commod15min V24 — starting")
     print(f"markets: {', '.join(asset(s) for s in SERIES)}")
     k = load_key(); sess = requests.Session()
     # POOL SIZE: fetch_open() fires one concurrent request per series
@@ -1057,9 +1087,11 @@ def main():
           f"no stop on reversal · "
           f"prices from WS feed (REST fallback) · full-window tick log on · "
           f"V23: entries event-driven off WS ticks, band checked on the ask, "
-          f"orders price-limited (entry <= ask+{MAX_ENTRY_SLIPPAGE_C}c capped at "
-          f"{ENTRY_CAP_C}c, stop >= bid-{MAX_STOP_SLIPPAGE_C}c), FOK kills retried "
-          f"after {ORDER_RETRY_SEC}s")
+          f"buy still triggers up to {ENTRY_CAP_GRACE_C}c over the cap · "
+          + (f"orders price-limited (entry <= ask+{MAX_ENTRY_SLIPPAGE_C}c, "
+             f"stop >= bid-{MAX_STOP_SLIPPAGE_C}c), FOK kills retried after "
+             f"{ORDER_RETRY_SEC}s" if USE_PRICE_LIMITS else
+             "order price limits OFF (99c/1c like V22)"))
 
     # One worker per market (was a flat 4) — if several markets trigger a
     # stop in the same moment (a broad move hits correlated assets
@@ -1269,11 +1301,14 @@ def main():
                     state[t] = {"phase": "armed",
                                 "retry_after": time.time() + ORDER_RETRY_SEC}
                 open_assets.discard(asset(t))
-            print(f"    (entry {side} {asset(t)} {t[-7:]} not filled inside "
-                  f"{limit:.0f}c limit — {reason}; will retry)")
+            print(f"    (entry {side} {asset(t)} {t[-7:]} not filled"
+                  f"{f' inside {limit:.0f}c limit' if USE_PRICE_LIMITS else ''}"
+                  f" — {reason}; will retry)")
 
         if LIVE:
-            need = int(limit * CONTRACTS)
+            # size the funds check off the price we expect to pay, not
+            # the limit (which is 99c when USE_PRICE_LIMITS is off)
+            need = int(min(limit, ask_seen + MAX_ENTRY_SLIPPAGE_C) * CONTRACTS)
             shard_bal = shard_cash.ensure(need)
             if shard_bal < need:
                 print(f"[skip-bal] {asset(t)} {t[-7:]} "
@@ -1329,8 +1364,10 @@ def main():
         # ASK — the price a buy actually pays — not on mid
         lead_yes = (yb + ya) >= 100
         ask = ya if lead_yes else 100 - yb
-        if ask < ENTRY_C or ask > ENTRY_CAP_C: return None
-        limit = min(ask + MAX_ENTRY_SLIPPAGE_C, ENTRY_CAP_C)
+        if ask < ENTRY_C or ask > ENTRY_CAP_C + ENTRY_CAP_GRACE_C: return None
+        # V24: not clamped to ENTRY_CAP_C any more — a fill 1c over the cap
+        # beats a missed trade. Only enforced when USE_PRICE_LIMITS is on.
+        limit = ask + MAX_ENTRY_SLIPPAGE_C if USE_PRICE_LIMITS else 99
         state[t] = {"phase": "entering"}
         open_assets.add(asset(t))
         return (t, lead_yes, ask, limit, src, src_age, time.time())
