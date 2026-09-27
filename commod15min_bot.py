@@ -1,4 +1,18 @@
 # ============================================================
+# Commod15min V25 — back to the 80/70 reversal strategy (parameter tuning
+# comes later). All V23/V24 speed fixes kept; order price limits still OFF.
+#   - Armed for the last 4 minutes of each market (TRIGGER_MIN = 4).
+#   - Favorite = first side to reach 80c (ENTRY_C; 81-82c also buys via
+#     ENTRY_CAP_GRACE_C). Buy CONTRACTS (10).
+#   - Fixed stop: Favorite's bid <= 70c (STOP_C) -> one combined order
+#     buys 2x (20) of the opposite side: closes the 10 held + opens 10 new.
+#     Stop is live the whole time the Favorite is held (STOP_ACTIVATE_SEC
+#     = the full 4-min window), not just the last 90s as in V19-V24.
+#   - Reversal held to settlement. No second stop/reversal.
+#   - Settlement rows now label the 3 outcomes: settle_win (Favorite won),
+#     rev_settle_win (reversal won), rev_settle_loss (reversed, but the
+#     Favorite won). settle_loss = Favorite lost without the stop firing.
+#
 # Commod15min V24 — two switches on top of V23:
 #   - USE_PRICE_LIMITS (default False): turns V23's order price limits
 #     off, so orders go out at 99c/1c exactly like V22 while every other
@@ -279,42 +293,23 @@ SERIES = [
     "KXPALLADIUM15M",
 ]
 
-TRIGGER_MIN        = 8.0  # watch/entry window — last 8 minutes only.
-                           # Tick-log analysis of the V22 full-window run
-                           # showed 6/7 crashed markets had already
-                           # stabilized onto their eventual favorite by
-                           # 8-10 min to close; entering earlier than that
-                           # just buys into a side that hasn't settled yet.
-                           # Only ENTRY happens on this window; the
-                           # stop-loss has its own, later window — see
-                           # STOP_ACTIVATE_SEC below.
-ENTRY_C            = 55   # buy the first side to reach 55c — a fixed,
-                           # cheap entry price instead of "whatever price
-                           # the favorite happens to be." Every win now
-                           # pays ~45c/contract (100-55) instead of the
-                           # old design's often-10-20c win off a late,
-                           # expensive, high-conviction entry.
-ENTRY_CAP_C        = 60   # ...but only buy within a few cents of that —
-                           # never chase a favorite that's already run up
-                           # past this. If it's already 61c+ the first
-                           # time we look, just wait; if it never comes
-                           # back into the 55-60 band before close, no
-                           # trade that cycle. This band (not an exact
-                           # 55c match) exists so a fast move that skips
-                           # straight past 55 in one tick still gets
-                           # bought, just a few cents higher — never at
-                           # 80-90c the way old entries could be.
-STOP_OFFSET_C      = 10   # relative stop: this many cents below entry —
-                           # but never below STOP_FLOOR_C (see stop_price()
-                           # below). With entries now capped at 60c, the
-                           # floor below never actually engages (60-10=50,
-                           # already under 70) — every entry gets the same
-                           # flat 10c stop, e.g. 55c entry -> 45c stop.
-STOP_FLOOR_C       = 70   # currently inert given ENTRY_CAP_C=60 (see
-                           # note above) — kept in case entries widen
-                           # again later. Net rule (one formula):
-                           # stop_px = min(entry_px - STOP_OFFSET_C,
-                           # STOP_FLOOR_C).
+TRIGGER_MIN        = 4.0  # V25: armed for the last 4 minutes of each
+                           # 15-min market (i.e. from minute 11 on). Entry
+                           # and stop both only happen inside this window.
+ENTRY_C            = 80   # V25: the Favorite = the first side whose price
+                           # (its ask — what a buy actually pays) reaches
+                           # 80c once armed. Buy CONTRACTS of it.
+ENTRY_CAP_C        = 80   # V25: target is exactly 80c; ENTRY_CAP_GRACE_C
+                           # (below) lets 81-82c still buy so a tick that
+                           # jumps a cent or two past 80 isn't a missed
+                           # trade. Above that, it waits for a pullback
+                           # into 80-82 (no trade if it never comes).
+STOP_C             = 70   # V25: fixed stop. If the held Favorite's bid
+                           # dips to 70c or less, reverse: one combined
+                           # order buys 2x CONTRACTS of the opposite side
+                           # (~30c) — the first 10 close out the Favorite,
+                           # the other 10 are the new reversal position,
+                           # held to settlement. No second stop/reversal.
 CONTRACTS          = 10
 POLL_SEC           = 0.5
 DAILY_LOSS_LIMIT_C = 1000
@@ -332,7 +327,10 @@ STOP_DEADBAND_SEC  = 2.0   # never fire a stop inside this many seconds
                             # A position still open this close just
                             # rides to the real REST settlement result
                             # instead, same as it always has.
-STOP_ACTIVATE_SEC  = 90.0  # the stop-loss check doesn't arm until the
+STOP_ACTIVATE_SEC  = TRIGGER_MIN * 60  # V25: stop is live the whole time
+                            # the Favorite is held (entry and stop share the
+                            # same 4-min window). Was 90s in V19-V24:
+                            # the stop-loss check doesn't arm until the
                             # window has this many seconds (or fewer) left
                             # to close — i.e. the stop is only "live"
                             # while STOP_DEADBAND_SEC < seconds-to-close
@@ -424,12 +422,10 @@ TICK_COLS = ["ts_iso","ticker","asset","phase","src",
 def asset(t): return t.split("15M")[0].replace("KX","")
 
 def stop_price(entry_px):
-    """Stop level for a position bought at entry_px: entry - STOP_OFFSET_C,
-    but never below STOP_FLOOR_C. Flat 10c below 80c entries, flat 70c
-    exit at 80c entries and up (a dip off a near-lock favorite has to be
-    much bigger to mean the same thing as the same cent-dip off a coin
-    flip)."""
-    return min(entry_px - STOP_OFFSET_C, STOP_FLOOR_C)
+    """V25: fixed stop level, the same for every entry — the Favorite is
+    reversed once its bid is at or below STOP_C (70c). (V19-V24 used a
+    stop relative to the entry price.)"""
+    return STOP_C
 
 def load_key():
     p = os.path.expanduser(PEM_PATH)
@@ -1041,7 +1037,7 @@ def start_feed(k):
 
 def main():
     global FEED, SPOT
-    print("Commod15min V24 — starting")
+    print("Commod15min V25 — starting")
     print(f"markets: {', '.join(asset(s) for s in SERIES)}")
     k = load_key(); sess = requests.Session()
     # POOL SIZE: fetch_open() fires one concurrent request per series
@@ -1070,28 +1066,17 @@ def main():
     shard_bal_start = shard_balance(sess, k) if LIVE else None
     print(f"mode={mode}  balance={'$%.2f'%(bal/100) if bal else '—'}"
           f"  shard{DEST_SHARD}={'$%.2f'%(shard_bal_start/100) if shard_bal_start is not None else '—'}")
-    print(f"rules: watch last {TRIGGER_MIN:.0f}m · buy first side to reach "
-          f"{ENTRY_C}-{ENTRY_CAP_C}c (fixed cheap entry, not chased higher — "
-          f"a favorite already above {ENTRY_CAP_C}c the first time we look just "
-          f"keeps getting watched, no trade that cycle), "
-          f"{CONTRACTS} contracts (FOK), "
-          f"stop {STOP_OFFSET_C}c below entry (floored at {STOP_FLOOR_C}c exit, "
-          f"currently inert given the {ENTRY_CAP_C}c entry cap), always reverse on stop "
-          f"(combined 2x FOK, sell+buy fallback), reversal held to settlement no stop · "
-          f"stop only ARMED in the last {STOP_ACTIVATE_SEC:.0f}s to close (rides "
-          f"unprotected before that — Kalshi settles on the final-minute average, "
-          f"not the instant at close), event-driven off WS ticks (poll {POLL_SEC}s "
-          f"as backstop), never within {STOP_DEADBAND_SEC:.0f}s of close (or if "
-          f"close time is unknown) · "
-          f"recheck before firing (skip if price recovered) · "
-          f"no stop on reversal · "
-          f"prices from WS feed (REST fallback) · full-window tick log on · "
-          f"V23: entries event-driven off WS ticks, band checked on the ask, "
-          f"buy still triggers up to {ENTRY_CAP_GRACE_C}c over the cap · "
+    print(f"rules: armed in the last {TRIGGER_MIN:.0f}m of each market · "
+          f"Favorite = first side whose ask reaches {ENTRY_C}c "
+          f"(buys up to {ENTRY_CAP_C + ENTRY_CAP_GRACE_C}c) · {CONTRACTS} contracts FOK · "
+          f"if its bid dips to {STOP_C}c or less: REVERSE — buy {2*CONTRACTS} of the "
+          f"opposite side in one order (closes the {CONTRACTS} held + opens {CONTRACTS} "
+          f"new), sell+buy fallback if that can't fill · reversal held to settlement, "
+          f"no more trading that market · stop off within {STOP_DEADBAND_SEC:.0f}s "
+          f"of close · entries+stops event-driven off WS ticks · "
           + (f"orders price-limited (entry <= ask+{MAX_ENTRY_SLIPPAGE_C}c, "
-             f"stop >= bid-{MAX_STOP_SLIPPAGE_C}c), FOK kills retried after "
-             f"{ORDER_RETRY_SEC}s" if USE_PRICE_LIMITS else
-             "order price limits OFF (99c/1c like V22)"))
+             f"stop >= bid-{MAX_STOP_SLIPPAGE_C}c)" if USE_PRICE_LIMITS else
+             "order price limits OFF"))
 
     # One worker per market (was a flat 4) — if several markets trigger a
     # stop in the same moment (a broad move hits correlated assets
@@ -1344,7 +1329,7 @@ def main():
                         "entry_iso": now_iso()}
         print(f"[{now():%H:%M:%S}] BUY {CONTRACTS}x {side} @ {fill:.0f}c  "
               f"{asset(t)} {t[-7:]}  run={run_net:+.0f}c  "
-              f"(target {ENTRY_C}-{ENTRY_CAP_C}c, saw ask {ask_seen:.0f}c via {src} "
+              f"(target {ENTRY_C}c, saw ask {ask_seen:.0f}c via {src} "
               f"age {src_age:.2f}s, slip {fill - ask_seen:+.0f}c, "
               f"{(time.time() - t_trig)*1000:.0f}ms trigger->fill)")
 
@@ -1491,9 +1476,27 @@ def main():
                 m = fetch_market(sess, k, t)
                 if m.get("status") in ("finalized","settled") and m.get("result"):
                     won = (m["result"] == "yes") == p["yes"]
-                    record(t, "settle_win" if won else "settle_loss",
+                    # V25: label which of the 3 outcomes this cycle was.
+                    #   settle_win      — outcome 1: Favorite held, won
+                    #   rev_settle_win  — outcome 2: reversed, reversal won
+                    #   rev_settle_loss — outcome 3: reversed, but the
+                    #                     Favorite won (reversal was wrong)
+                    #   settle_loss     — Favorite held and lost without
+                    #                     ever triggering the 70c stop
+                    #                     (e.g. fell inside the last 2s)
+                    is_rev = p["phase"] == "reversal"
+                    reason = (("rev_settle_win" if won else "rev_settle_loss")
+                              if is_rev else
+                              ("settle_win" if won else "settle_loss"))
+                    record(t, reason,
                            p["entry_px"], 100 if won else 0,
                            p["yes"], p["lots"])
+                    print("    outcome: " + {
+                        "settle_win": "1 — Favorite won",
+                        "rev_settle_win": "2 — reversal won",
+                        "rev_settle_loss": "3 — Favorite won after being reversed out",
+                        "settle_loss": "Favorite lost (stop never triggered)",
+                    }[reason] + f"  {asset(t)} {t[-7:]}")
                     open_assets.discard(asset(t))
                     state[t] = {"phase": "done"}
 
