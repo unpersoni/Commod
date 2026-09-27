@@ -1,4 +1,44 @@
 # ============================================================
+# Commod15min V23 — ORDER PRICE ACCURACY / LATENCY. Fills were landing
+# 7-11c past the target (e.g. 87-91c on an 80c trigger). Causes, and
+# what changed for each:
+#   1. NO PRICE LIMIT ON ORDERS (biggest cause). place_order() sent every
+#      buy at a 99c limit and every sell at 1c — a FOK market order in
+#      disguise. Whenever the best price didn't have all 10 contracts,
+#      the order walked up the book and filled at whatever the deeper
+#      levels were. Now every order carries a real limit: entries pay at
+#      most the ask seen at trigger + MAX_ENTRY_SLIPPAGE_C (never above
+#      ENTRY_CAP_C); stops/reversals accept at most MAX_STOP_SLIPPAGE_C
+#      worse than the bid seen at trigger. If the book can't fill 10
+#      contracts inside that, FOK kills it (no fill, no fee) and the bot
+#      retries on the next tick instead of taking a bad price.
+#   2. ENTRIES WERE POLL-DRIVEN. Stops already fired off WS ticks, but
+#      entries only got checked once per main-loop cycle — after 11 REST
+#      /markets calls, the settle checks, and a 0.5s sleep — so the
+#      price had often run well past the target by the time the bot
+#      looked. Entries are now event-driven off the same WS tick handler
+#      as stops (handle_tick), with the order placed on a worker thread.
+#   3. EXTRA REST ROUND TRIPS BEFORE/AFTER THE BUY. The entry path did a
+#      live balance check (ensure_shard_funds, plus up to ~1.5s of
+#      transfer retry-sleeps if short) before ordering, and a
+#      get_balance() call after (its result was never used). Entries now
+#      use ShardCash's local balance like stops already did.
+#   4. A WASTED CYCLE ON ARM. The first cycle a market entered the watch
+#      window only flipped it watch->armed and `continue`d, so a market
+#      already at the target waited an extra full cycle to be bought.
+#   5. ENTRY BAND WAS CHECKED ON MID, NOT THE PRICE ACTUALLY PAID. A buy
+#      fills at the ask, which sits above mid by half the spread. The
+#      band is now checked against the favorite's ask, so the target is
+#      the price you pay.
+#   6. ONE ENTRY PER CYCLE (entered_this_cycle) made a second market that
+#      hit its target at the same moment wait a full cycle; removed —
+#      open_assets + ShardCash still guard against double-buys/overspend.
+#   PAPER mode now simulates fills at the ask/bid seen at execution time
+#   (and simulates a FOK kill if that's past the limit) instead of
+#   always filling at mid, so paper results reflect real fill prices.
+#   Every BUY/STOP line now prints target, seen, fill, slippage, and
+#   trigger->fill milliseconds so accuracy can be checked directly.
+#
 # Commod15min V22 — new strategy, workshopped over several rounds:
 #   - TRIGGER_MIN 5.0 -> 15.0: watch the full market lifetime (window
 #     open to close), not just a trailing slice — otherwise a favorite
@@ -292,6 +332,23 @@ STOP_ACTIVATE_SEC  = 90.0  # the stop-loss check doesn't arm until the
                             # mean-revert before they'd matter anyway;
                             # this concentrates the stop on the stretch
                             # that's actually close to decisive.
+MAX_ENTRY_SLIPPAGE_C = 2   # V23: an entry order pays at most this many
+                            # cents above the ask seen when the trigger
+                            # fired (and never above ENTRY_CAP_C). If the
+                            # book can't fill all CONTRACTS inside that,
+                            # the FOK is killed and the bot retries on the
+                            # next tick. 0 = only ever fill at the exact
+                            # price seen.
+MAX_STOP_SLIPPAGE_C  = 2   # V23: a stop/reversal order accepts at most
+                            # this many cents worse than the bid seen when
+                            # the stop fired. If price gaps past that
+                            # before the order lands, the FOK is killed
+                            # and the stop re-fires on the next tick,
+                            # priced off the new bid — it never walks the
+                            # book down to 1c the way the old orders could.
+ORDER_RETRY_SEC      = 0.5 # V23: minimum gap between order attempts on
+                            # the same market after a FOK kill, so a thin
+                            # book doesn't turn into an order-spam loop.
 
 # Twelve Data commodity spot sourcing REMOVED in V22 — free-tier credits
 # ran out, and only gold ever actually worked free (silver/WTI/platinum/
@@ -536,23 +593,33 @@ def ensure_shard_funds(sess, k, need_c, dest=DEST_SHARD, quiet=False):
         bal = shard_balance(sess, k, dest)
     return bal
 
-def place_order(sess, k, ticker, action, yes_side, count):
+def place_order(sess, k, ticker, action, yes_side, count, limit_c=None):
     """
     V2 order — /portfolio/events/orders, fill_or_kill.
-    Price is set a few cents past the market so it crosses and fills instantly,
-    but close enough to the real price that Kalshi reserves ~actual cost
-    (not $9.90 from a 99c limit). bid=buy YES, ask=sell YES(=buy NO).
-    FOK = all-or-nothing: the full count fills immediately or the whole
-    order is killed with no partial fill, matching the strategy spec.
+    bid=buy YES, ask=sell YES(=buy NO).
+    limit_c is the worst price accepted, in cents OF THE SIDE BEING
+    TRADED: for a buy, the most we'll pay for that side; for a sell, the
+    least we'll accept for it. (NO-side limits are converted to the YES
+    book here: buying NO at <=L is selling YES at >=100-L, etc.)
+    V23: limit_c=None used to be the only mode — a 99c buy / 1c sell,
+    i.e. a market order that walked the book whenever the top level
+    didn't have the full count. Every trading call site now passes a
+    real limit; None is kept only for the 1-contract test cell.
+    FOK = all-or-nothing: the full count fills immediately at or better
+    than the limit, or the whole order is killed with no partial fill.
     Orders always go through REST — Kalshi's WebSocket API is market-data
     only, there is no order-placement channel.
     """
+    if limit_c is None:
+        limit_c = 99 if action == "buy" else 1
+    limit_c = max(1, min(99, int(round(limit_c))))
     if action == "buy":
         book_side = "bid" if yes_side else "ask"
-        price = "0.9900" if yes_side else "0.0100"
+        yes_px = limit_c if yes_side else 100 - limit_c
     else:
         book_side = "ask" if yes_side else "bid"
-        price = "0.0100" if yes_side else "0.9900"
+        yes_px = limit_c if yes_side else 100 - limit_c
+    price = f"{yes_px/100:.4f}"
 
     body = {
         "ticker":                     ticker,
@@ -944,7 +1011,7 @@ def start_feed(k):
 
 def main():
     global FEED, SPOT
-    print("Commod15min V22 — starting")
+    print("Commod15min V23 — starting")
     print(f"markets: {', '.join(asset(s) for s in SERIES)}")
     k = load_key(); sess = requests.Session()
     # POOL SIZE: fetch_open() fires one concurrent request per series
@@ -988,7 +1055,11 @@ def main():
           f"close time is unknown) · "
           f"recheck before firing (skip if price recovered) · "
           f"no stop on reversal · "
-          f"prices from WS feed (REST fallback) · full-window tick log on")
+          f"prices from WS feed (REST fallback) · full-window tick log on · "
+          f"V23: entries event-driven off WS ticks, band checked on the ask, "
+          f"orders price-limited (entry <= ask+{MAX_ENTRY_SLIPPAGE_C}c capped at "
+          f"{ENTRY_CAP_C}c, stop >= bid-{MAX_STOP_SLIPPAGE_C}c), FOK kills retried "
+          f"after {ORDER_RETRY_SEC}s")
 
     # One worker per market (was a flat 4) — if several markets trigger a
     # stop in the same moment (a broad move hits correlated assets
@@ -1094,15 +1165,25 @@ def main():
                   f"— skip, {asset(t)} {t[-7:]})")
             return
 
+        # V23 PRICE LIMIT: never accept more than MAX_STOP_SLIPPAGE_C
+        # worse than the bid we just saw. Priced off the live bid (not
+        # the nominal stop level) so a genuine gap-through still exits,
+        # just never by walking the book toward 1c.
+        exit_floor = max(1, held_bid - MAX_STOP_SLIPPAGE_C)
+        t_trig = time.time()
+
         rev_yes = not p["yes"]
         combo_ok = False
         if LIVE:
             rev_ask_est = 100 - held_bid
-            need = int(rev_ask_est * 2 * p["lots"])
+            need = int((100 - exit_floor) * 2 * p["lots"])
             shard_bal = shard_cash.ensure(need)
             if shard_bal >= need:
+                # buying 2x the other side at <= 100-exit_floor: the first
+                # 1x nets out the held side at >= exit_floor
                 filledC, avgC, fpC = place_order(
-                    sess, k, t, "buy", rev_yes, 2 * p["lots"])
+                    sess, k, t, "buy", rev_yes, 2 * p["lots"],
+                    limit_c=100 - exit_floor)
                 if filledC:
                     combo_ok = True
                     rev_fill = (avgC if rev_yes else 100-avgC) \
@@ -1120,10 +1201,14 @@ def main():
             # the position is never stranded.
             if LIVE:
                 filled, avg, fp = place_order(
-                    sess, k, t, "sell", p["yes"], p["lots"])
+                    sess, k, t, "sell", p["yes"], p["lots"],
+                    limit_c=exit_floor)
                 if not filled:
+                    # price moved past the limit before the order landed —
+                    # re-fire on the next tick, priced off the new bid
                     with state_lock:
-                        state[t] = dict(p, phase="long")  # retry next tick
+                        state[t] = dict(p, phase="long",
+                                        retry_after=time.time() + ORDER_RETRY_SEC)
                     return
                 exit_px = (avg if p["yes"] else 100-avg) \
                            if avg is not None else held_bid
@@ -1131,8 +1216,10 @@ def main():
                 exit_px = held_bid
 
         record(t, "stop", p["entry_px"], exit_px, p["yes"], p["lots"])
-        print(f"    (saw bid={held_bid:.0f}c at trigger via {src}, "
-              f"age {src_age:.2f}s"
+        print(f"    (stop level={stop_px:.0f}c, saw bid={held_bid:.0f}c via {src} "
+              f"age {src_age:.2f}s, filled {exit_px:.0f}c "
+              f"[{exit_px - stop_px:+.0f}c vs stop], "
+              f"{(time.time() - t_trig)*1000:.0f}ms"
               f"{', combined order' if combo_ok else ''})")
 
         if not combo_ok:
@@ -1146,7 +1233,8 @@ def main():
                         open_assets.discard(asset(t)); state[t] = {"phase": "done"}
                     return
                 filled2, avg2, fp2 = place_order(
-                    sess, k, t, "buy", rev_yes, p["lots"])
+                    sess, k, t, "buy", rev_yes, p["lots"],
+                    limit_c=100 - exit_px + MAX_STOP_SLIPPAGE_C)
                 if not filled2:
                     print(f"[reverse-fail] {asset(t)} {t[-7:]}")
                     with state_lock:
@@ -1166,16 +1254,112 @@ def main():
               f"{'YES' if rev_yes else 'NO'} @ {rev_fill:.0f}c  "
               f"{asset(t)} {t[-7:]}")
 
-    def handle_tick(t, yb, ya):
+    def do_entry(t, lead_yes, ask_seen, limit, src, src_age, t_trig):
+        """V23: runs on a worker thread in LIVE (inline in PAPER), submitted
+        by try_entry the instant a tick puts the favorite's ask in the
+        entry band. The position is already claimed (phase='entering',
+        asset in open_assets) so nothing can double-buy it meanwhile."""
+        side = "YES" if lead_yes else "NO"
+
+        def release(reason):
+            # FOK killed / no funds: go back to armed and retry on a later
+            # tick, same as if the band hadn't been reached yet
+            with state_lock:
+                if state.get(t, {}).get("phase") == "entering":
+                    state[t] = {"phase": "armed",
+                                "retry_after": time.time() + ORDER_RETRY_SEC}
+                open_assets.discard(asset(t))
+            print(f"    (entry {side} {asset(t)} {t[-7:]} not filled inside "
+                  f"{limit:.0f}c limit — {reason}; will retry)")
+
+        if LIVE:
+            need = int(limit * CONTRACTS)
+            shard_bal = shard_cash.ensure(need)
+            if shard_bal < need:
+                print(f"[skip-bal] {asset(t)} {t[-7:]} "
+                      f"need ~{need}c on shard {DEST_SHARD}, have {shard_bal}c "
+                      f"(after sweep attempt)")
+                with state_lock:
+                    state[t] = {"phase": "done"}
+                    open_assets.discard(asset(t))
+                return
+            filled, avg, fp = place_order(sess, k, t, "buy", lead_yes,
+                                          CONTRACTS, limit_c=limit)
+            if not filled:
+                release("book moved or too thin")
+                return
+            fill = (avg if lead_yes else 100 - avg) if avg is not None else ask_seen
+            shard_cash.debit(int(fill * CONTRACTS))
+        else:
+            # PAPER: simulate the FOK against the price as it stands now,
+            # at the ask (what a buy actually pays), not mid
+            fresh = FEED.get(t) if FEED is not None else None
+            ask_now = ask_seen
+            if fresh is not None:
+                fyb, fya, _, _ = fresh
+                ask_now = fya if lead_yes else 100 - fyb
+            if ask_now > limit:
+                release(f"ask now {ask_now:.0f}c")
+                return
+            fill = ask_now
+
+        with state_lock:
+            state[t] = {"phase": "long", "yes": lead_yes,
+                        "entry_px": fill, "lots": CONTRACTS,
+                        "entry_iso": now_iso()}
+        print(f"[{now():%H:%M:%S}] BUY {CONTRACTS}x {side} @ {fill:.0f}c  "
+              f"{asset(t)} {t[-7:]}  run={run_net:+.0f}c  "
+              f"(target {ENTRY_C}-{ENTRY_CAP_C}c, saw ask {ask_seen:.0f}c via {src} "
+              f"age {src_age:.2f}s, slip {fill - ask_seen:+.0f}c, "
+              f"{(time.time() - t_trig)*1000:.0f}ms trigger->fill)")
+
+    def try_entry(t, p, yb, ya, src, src_age):
+        """V23: event-driven entry check. Called with state_lock HELD, from
+        handle_tick (WS thread, the instant a tick lands) and from the
+        main loop (REST fallback / backstop). Returns the do_entry args
+        if it claimed the market, else None."""
+        if halt: return None
+        if time.time() < p.get("retry_after", 0): return None
+        ct = close_at.get(t)
+        if ct is None: return None
+        s2c = (ct - now()).total_seconds()
+        if s2c <= 0 or s2c > TRIGGER_MIN * 60: return None
+        if asset(t) in open_assets: return None
+        # favorite = side with the higher mid; the band is checked on its
+        # ASK — the price a buy actually pays — not on mid
+        lead_yes = (yb + ya) >= 100
+        ask = ya if lead_yes else 100 - yb
+        if ask < ENTRY_C or ask > ENTRY_CAP_C: return None
+        limit = min(ask + MAX_ENTRY_SLIPPAGE_C, ENTRY_CAP_C)
+        state[t] = {"phase": "entering"}
+        open_assets.add(asset(t))
+        return (t, lead_yes, ask, limit, src, src_age, time.time())
+
+    def handle_tick(t, yb, ya, src="ws", src_age=0.0):
         """Fast path: called directly from the WS thread the instant a
         price update lands (and also once per poll cycle for the REST-
         fallback case) — must stay cheap. Just checks the trigger and,
-        if it fires, claims the position (phase='stopping', so nothing
-        else can double-fire on it) and hands the actual order off to a
-        worker thread via do_stop."""
+        if it fires, claims the position (phase='entering'/'stopping', so
+        nothing else can double-fire on it) and hands the actual order
+        off to a worker thread via do_entry/do_stop. V23: entries are
+        handled here too now, not just stops."""
+        with state_lock:
+            p = state.get(t)
+            if not p: return
+            if p.get("phase") in ("watch", "armed"):
+                args = try_entry(t, p, yb, ya, src, src_age)
+                if args is None: return
+            else:
+                args = None
+        if args is not None:
+            if LIVE: order_executor.submit(do_entry, *args)
+            else:    do_entry(*args)
+            return
         with state_lock:
             p = state.get(t)
             if not p or p.get("phase") != "long":
+                return
+            if time.time() < p.get("retry_after", 0):
                 return
             # STOP ARM WINDOW: the stop only watches while
             # STOP_DEADBAND_SEC < seconds-to-close <= STOP_ACTIVATE_SEC.
@@ -1276,8 +1460,6 @@ def main():
                     open_assets.discard(asset(t))
                     state[t] = {"phase": "done"}
 
-            entered_this_cycle = False
-
             for t, m in live.items():
                 p  = state[t]
                 ct = close_at.get(t)
@@ -1331,85 +1513,26 @@ def main():
 
                 if p["phase"] == "done": continue  # logged above; nothing more to act on
 
-                # ── WATCH: one-time transition to ARMED, just for the
-                # status line — no branching on price here, unlike V12 ──
-                if p["phase"] == "watch":
-                    state[t] = {"phase": "armed"}
-                    print(f"[armed] {asset(t)} {t[-7:]} "
-                          f"fav={lmid:.0f} {s2c:.0f}s to close")
-                    continue  # elif prevents same-cycle buy
+                # ── WATCH -> ARMED: status line only. V23: no `continue`
+                # here any more — a market already sitting at the target
+                # when its watch window opens gets bought THIS cycle, not
+                # one full cycle later ──
+                with state_lock:
+                    if state[t].get("phase") == "watch":
+                        state[t] = {"phase": "armed"}
+                        print(f"[armed] {asset(t)} {t[-7:]} "
+                              f"fav={lmid:.0f} {s2c:.0f}s to close")
 
-                # ── ARMED: buy the first side to become the favorite,
-                # but only within the [ENTRY_C, ENTRY_CAP_C] band (51c-
-                # 90c) — covers "already in-band the moment we started
-                # watching," "breaks out into the band later," and
-                # "was already too high, then fell back into the band"
-                # all the same way, same stop/reverse either way (this
-                # replaces V12's separate no-stop hold path). Above the
-                # cap just keeps watching — no trade until/unless it
-                # comes back down ──
-                elif p["phase"] == "armed":
-                    if halt or entered_this_cycle: continue
-                    if asset(t) in open_assets: continue
-
-                    lead_yes = ymid >= nmid
-
-                    if lmid < ENTRY_C or lmid > ENTRY_CAP_C: continue
-
-                    if LIVE:
-                        need = int(lmid * CONTRACTS)
-                        shard_bal = ensure_shard_funds(sess, k, need)
-                        if shard_bal < need:
-                            print(f"[skip-bal] {asset(t)} {t[-7:]} "
-                                  f"need ~{need}c on shard {DEST_SHARD}, have {shard_bal}c "
-                                  f"(after sweep attempt)")
-                            state[t] = {"phase": "done"}; continue
-
-                    # commit to this market NOW — no other market buys this cycle
-                    entered_this_cycle = True
-
-                    if LIVE:
-                        filled, avg, fp = place_order(
-                            sess, k, t, "buy", lead_yes, CONTRACTS)
-                        if not filled:
-                            state[t] = {"phase": "done"}; continue
-                        fill = (avg if lead_yes else 100-avg) \
-                               if avg is not None else lmid
-                        lots = CONTRACTS
-                    else:
-                        fill = lmid; lots = CONTRACTS
-
-                    # NOTE: the old "instant bad fill" check here compared
-                    # the fill to a FIXED stop floor (STOP_C) — with a
-                    # relative stop (entry - STOP_OFFSET_C) that comparison
-                    # is nonsensical (a fill can't be at/below a stop
-                    # that's defined relative to itself), so it's removed.
-                    # In PAPER mode fill always equals lmid exactly (no
-                    # slippage simulated) so this branch was already dead
-                    # code here either way. If LIVE trading resumes, a
-                    # real slippage sanity check (actual fill vs. the lmid
-                    # seen when deciding to buy) should be reconsidered —
-                    # flagging this, not silently dropping it.
-
-                    state[t] = {"phase": "long", "yes": lead_yes,
-                                "entry_px": fill, "lots": lots,
-                                "entry_iso": now_iso()}
-                    open_assets.add(asset(t))
-                    if LIVE: bal = get_balance(sess, k)
-                    print(f"[{now():%H:%M:%S}] BUY {lots}x "
-                          f"{'YES' if lead_yes else 'NO'} @ {fill:.0f}c  "
-                          f"{asset(t)} {t[-7:]}  run={run_net:+.0f}c  "
-                          f"(saw {lmid:.0f}c via {src}, age {src_age:.2f}s)")
-
-                # ── LONG: check stop ──
-                # SPEED: the real trigger check now happens the instant a
-                # WS tick lands (handle_tick, wired to FEED.on_tick) —
-                # this call covers the REST-fallback case and is a cheap
-                # no-op if the WS path already claimed/handled it (phase
-                # will no longer be "long" by the time this runs).
-                elif p["phase"] == "long":
-                    handle_tick(t, yb, ya)
-
+                # ── ARMED (entry) / LONG (stop) ──
+                # V23: both triggers are event-driven now — handle_tick
+                # runs the instant a WS tick lands. This call is the
+                # backstop for the REST-fallback case (WS stale) and a
+                # cheap no-op otherwise: whichever path gets there first
+                # claims the market under state_lock ("entering" /
+                # "stopping"), so nothing double-fires. Every order is
+                # price-limited, so a stale snapshot here can't produce a
+                # bad fill — at worst a killed FOK.
+                handle_tick(t, yb, ya, src, src_age)
                 # ── "stopping": in-flight, being handled by a worker
                 # thread right now — nothing to do here.
                 # ── "reversal": hold to settlement, no stop
