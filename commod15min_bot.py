@@ -1,13 +1,14 @@
 # ============================================================
-# Commod15min V26 — 75/65 reversal strategy. All V23/V24 speed fixes
-# kept; order price limits still OFF.
-#   - Armed for the last 4 minutes of each market (TRIGGER_MIN = 4).
-#   - Favorite = first side to reach 75c (ENTRY_C; 76-77c also buys via
-#     ENTRY_CAP_GRACE_C). Buy CONTRACTS (10).
-#   - Fixed stop: Favorite's bid <= 65c (STOP_C) -> one combined order
-#     buys 2x (20) of the opposite side: closes the 10 held + opens 10 new.
-#     Stop is live the whole time the Favorite is held (STOP_ACTIVATE_SEC
-#     = the full 4-min window), not just the last 90s as in V19-V24.
+# Commod15min V27 — 55-90c entry band, 10c dynamic stop, 60-second
+# window (WTI: 4 minutes). All V23/V24 speed fixes kept; order price
+# limits still OFF.
+#   - Armed for the last 60 seconds of each market (TRIGGER_MIN = 1).
+#     Exception: WTI armed for the last 4 minutes (WTI_TRIGGER_MIN = 4).
+#   - Favorite = first side whose ask is between 55c and 90c (ENTRY_C
+#     to ENTRY_CAP_C). Buy CONTRACTS (10).
+#   - Dynamic stop: Favorite's bid dips 10c below the entry price
+#     (STOP_OFFSET_C = 10) -> one combined order buys 2x (20) of the
+#     opposite side: closes the 10 held + opens 10 new.
 #   - Reversal held to settlement. No second stop/reversal.
 #   - Settlement rows now label the 3 outcomes: settle_win (Favorite won),
 #     rev_settle_win (reversal won), rev_settle_loss (reversed, but the
@@ -293,20 +294,15 @@ SERIES = [
     "KXPALLADIUM15M",
 ]
 
-TRIGGER_MIN        = 4.0  # V26: armed for the last 4 minutes of each
-                           # 15-min market (i.e. from minute 11 on). Entry
-                           # and stop both only happen inside this window.
-ENTRY_C            = 75   # V26: the Favorite = the first side whose price
-                           # (its ask — what a buy actually pays) reaches
-                           # 75c once armed. Buy CONTRACTS of it.
-ENTRY_CAP_C        = 75   # V26: target is exactly 75c; ENTRY_CAP_GRACE_C
-                           # (below) lets 76-77c still buy so a tick that
-                           # jumps a cent or two past 75 isn't a missed
-                           # trade. Above that, it waits for a pullback
-                           # into 75-77 (no trade if it never comes).
-STOP_C             = 65   # V26: fixed stop. If the held Favorite's bid
-                           # dips to 65c or less, reverse. A 10c dip
-                           # (75→65) triggers the 2x reversal order.
+TRIGGER_MIN        = 1.0  # V27: armed for the last 60 seconds of each
+                           # 15-min market. Entry and stop both only
+                           # happen inside this window.
+WTI_TRIGGER_MIN    = 4.0  # V27: WTI gets a wider window (last 4 minutes).
+ENTRY_C            = 55   # V27: the Favorite = the first side whose ask
+                           # is between ENTRY_C and ENTRY_CAP_C.
+ENTRY_CAP_C        = 90   # V27: upper bound of the entry band.
+STOP_OFFSET_C      = 10   # V27: dynamic stop — reverse when the held
+                           # Favorite's bid dips 10c below entry price.
 CONTRACTS          = 10
 POLL_SEC           = 0.5
 DAILY_LOSS_LIMIT_C = 1000
@@ -324,9 +320,9 @@ STOP_DEADBAND_SEC  = 2.0   # never fire a stop inside this many seconds
                             # A position still open this close just
                             # rides to the real REST settlement result
                             # instead, same as it always has.
-STOP_ACTIVATE_SEC  = TRIGGER_MIN * 60  # V25: stop is live the whole time
+STOP_ACTIVATE_SEC  = TRIGGER_MIN * 60  # V27: stop is live the whole time
                             # the Favorite is held (entry and stop share the
-                            # same 3-min window). Was 90s in V19-V24:
+                            # same window). Was 90s in V19-V24:
                             # the stop-loss check doesn't arm until the
                             # window has this many seconds (or fewer) left
                             # to close — i.e. the stop is only "live"
@@ -349,10 +345,7 @@ USE_PRICE_LIMITS     = False  # V24: master switch for the order price
                             # to measure how much the speed fixes alone
                             # close the gap, then flip to True to add the
                             # limits on top.
-ENTRY_CAP_GRACE_C    = 2   # V24: an ask up to this many cents ABOVE
-                            # ENTRY_CAP_C still triggers the buy, so a
-                            # market that ticks 1-2c past the cap between
-                            # updates isn't a missed trade. 0 = hard cap.
+ENTRY_CAP_GRACE_C    = 0   # V27: hard cap — band is exactly 55-90c.
 MAX_ENTRY_SLIPPAGE_C = 2   # V23 (only when USE_PRICE_LIMITS): an entry
                             # order pays at most this many cents above the
                             # ask seen when the trigger fired. If the
@@ -418,11 +411,14 @@ TICK_COLS = ["ts_iso","ticker","asset","phase","src",
 
 def asset(t): return t.split("15M")[0].replace("KX","")
 
+def trigger_min(t):
+    """V27: per-market arm window. WTI gets 4 minutes, everything else 60s."""
+    return WTI_TRIGGER_MIN if asset(t) == "WTI" else TRIGGER_MIN
+
 def stop_price(entry_px):
-    """V25: fixed stop level, the same for every entry — the Favorite is
-    reversed once its bid is at or below STOP_C (70c). (V19-V24 used a
-    stop relative to the entry price.)"""
-    return STOP_C
+    """V27: dynamic stop — reverse when the held Favorite's bid dips
+    STOP_OFFSET_C (10c) below the entry price."""
+    return entry_px - STOP_OFFSET_C
 
 def load_key():
     p = os.path.expanduser(PEM_PATH)
@@ -699,6 +695,7 @@ class PriceFeed:
         self.stop_flag = threading.Event()
         self._next_id = 1
         self.connect_count = 0
+        self._ws_err_count = 0
         self.on_tick = None  # set by main(): called as on_tick(ticker, yes_bid, yes_ask)
                               # the instant a price update lands, for event-driven stops
 
@@ -709,9 +706,9 @@ class PriceFeed:
 
     def _headers(self):
         ts = str(int(time.time()*1000))
-        return [f"KALSHI-ACCESS-KEY: {KEY_ID}",
-                f"KALSHI-ACCESS-SIGNATURE: {_sign(self.k, ts, 'GET', WS_PATH)}",
-                f"KALSHI-ACCESS-TIMESTAMP: {ts}"]
+        return {"KALSHI-ACCESS-KEY": KEY_ID,
+                "KALSHI-ACCESS-SIGNATURE": _sign(self.k, ts, 'GET', WS_PATH),
+                "KALSHI-ACCESS-TIMESTAMP": ts}
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -732,6 +729,7 @@ class PriceFeed:
                 self.ws = ws
                 self.sid = None
                 self.connect_count += 1
+                self._ws_err_count = 0
                 backoff = 1
                 with self.lock:
                     want = set(self.tracked)
@@ -751,7 +749,11 @@ class PriceFeed:
                     if self.ws: self.ws.close()
                 except Exception: pass
                 self.ws = None; self.sid = None
-                print(f"[ws] disconnected ({e}) — reconnecting in {backoff:.0f}s")
+                self._ws_err_count += 1
+                if self._ws_err_count == 1:
+                    print(f"[ws] disconnected ({e}) — will retry silently")
+                elif self._ws_err_count % 50 == 0:
+                    print(f"[ws] still disconnected after {self._ws_err_count} attempts")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30)
 
@@ -1063,12 +1065,12 @@ def main():
     shard_bal_start = shard_balance(sess, k) if LIVE else None
     print(f"mode={mode}  balance={'$%.2f'%(bal/100) if bal else '—'}"
           f"  shard{DEST_SHARD}={'$%.2f'%(shard_bal_start/100) if shard_bal_start is not None else '—'}")
-    print(f"rules: armed in the last {TRIGGER_MIN:.0f}m of each market · "
-          f"Favorite = first side whose ask reaches {ENTRY_C}c "
-          f"(buys up to {ENTRY_CAP_C + ENTRY_CAP_GRACE_C}c) · {CONTRACTS} contracts FOK · "
-          f"if its bid dips to {STOP_C}c or less: REVERSE — buy {2*CONTRACTS} of the "
-          f"opposite side in one order (closes the {CONTRACTS} held + opens {CONTRACTS} "
-          f"new), sell+buy fallback if that can't fill · reversal held to settlement, "
+    print(f"rules: armed in the last {TRIGGER_MIN*60:.0f}s of each market "
+          f"(WTI: last {WTI_TRIGGER_MIN:.0f}m) · "
+          f"Favorite = first side whose ask is {ENTRY_C}-{ENTRY_CAP_C}c · "
+          f"{CONTRACTS} contracts FOK · "
+          f"dynamic stop: if held favorite dips {STOP_OFFSET_C}c from entry → "
+          f"REVERSE {2*CONTRACTS} opposite · reversal held to settlement, "
           f"no more trading that market · stop off within {STOP_DEADBAND_SEC:.0f}s "
           f"of close · entries+stops event-driven off WS ticks · "
           + (f"orders price-limited (entry <= ask+{MAX_ENTRY_SLIPPAGE_C}c, "
@@ -1340,7 +1342,7 @@ def main():
         ct = close_at.get(t)
         if ct is None: return None
         s2c = (ct - now()).total_seconds()
-        if s2c <= 0 or s2c > TRIGGER_MIN * 60: return None
+        if s2c <= 0 or s2c > trigger_min(t) * 60: return None
         if asset(t) in open_assets: return None
         # favorite = side with the higher mid; the band is checked on its
         # ASK — the price a buy actually pays — not on mid
@@ -1399,7 +1401,7 @@ def main():
             if ct is None:
                 return
             s2c = (ct - now()).total_seconds()
-            if s2c <= STOP_DEADBAND_SEC or s2c > STOP_ACTIVATE_SEC:
+            if s2c <= STOP_DEADBAND_SEC or s2c > trigger_min(t) * 60:
                 return
             held_bid = yb if p["yes"] else (100 - ya)
             if held_bid > stop_price(p["entry_px"]):
@@ -1503,7 +1505,7 @@ def main():
                 if ct is None: continue
                 s2c = (ct - now()).total_seconds()
                 if s2c <= 0: continue
-                if s2c > TRIGGER_MIN * 60: continue  # outside the watch window
+                if s2c > trigger_min(t) * 60: continue  # outside the watch window
 
                 # SPEED: prefer the WS feed's price — pushed the instant it
                 # changes — over the REST batch snapshot, which can only be
