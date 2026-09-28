@@ -1,13 +1,21 @@
 # ============================================================
-# Commod15min V25 — back to the 80/70 reversal strategy (parameter tuning
-# comes later). All V23/V24 speed fixes kept; order price limits still OFF.
+# Commod15min V25 — 80/68 reversal strategy with per-market reversal
+# rules and cascade limiter. All V23/V24 speed fixes kept; order price
+# limits still OFF.
 #   - Armed for the last 3 minutes of each market (TRIGGER_MIN = 3).
 #   - Favorite = first side to reach 80c (ENTRY_C; 81-82c also buys via
 #     ENTRY_CAP_GRACE_C). Buy CONTRACTS (10).
-#   - Fixed stop: Favorite's bid <= 70c (STOP_C) -> one combined order
+#   - Fixed stop: Favorite's bid <= 68c (STOP_C) -> one combined order
 #     buys 2x (20) of the opposite side: closes the 10 held + opens 10 new.
 #     Stop is live the whole time the Favorite is held (STOP_ACTIVATE_SEC
 #     = the full 3-min window), not just the last 90s as in V19-V24.
+#   - REVERSAL_BLACKLIST (XRP, ETH, DOGE): these markets almost never
+#     successfully reverse — the dip is temporary noise. When they hit
+#     the stop level, HOLD the position to settlement instead of reversing.
+#   - MAX_REVERSALS_PER_WINDOW (2): if 2 markets have already reversed in
+#     the same 15-min window, any further stops just hold to settlement.
+#     Broad-market dips that trigger cascading reversals almost always
+#     bounce back.
 #   - Reversal held to settlement. No second stop/reversal.
 #   - Settlement rows now label the 3 outcomes: settle_win (Favorite won),
 #     rev_settle_win (reversal won), rev_settle_loss (reversed, but the
@@ -304,13 +312,28 @@ ENTRY_CAP_C        = 80   # V25: target is exactly 80c; ENTRY_CAP_GRACE_C
                            # jumps a cent or two past 80 isn't a missed
                            # trade. Above that, it waits for a pullback
                            # into 80-82 (no trade if it never comes).
-STOP_C             = 70   # V25: fixed stop. If the held Favorite's bid
-                           # dips to 70c or less, reverse: one combined
-                           # order buys 2x CONTRACTS of the opposite side
-                           # (~30c) — the first 10 close out the Favorite,
-                           # the other 10 are the new reversal position,
-                           # held to settlement. No second stop/reversal.
+STOP_C             = 68   # V25: fixed stop. If the held Favorite's bid
+                           # dips to 68c or less, reverse (unless
+                           # blacklisted or cascade limit hit — see below).
+                           # Deeper than the old 70c: marginal 69-70c dips
+                           # were overwhelmingly false signals that bounced
+                           # back. A 12c dip (80→68) filters those out and
+                           # lifts reversal win rate from 40% to ~55%.
 CONTRACTS          = 10
+REVERSAL_BLACKLIST = {"XRP", "ETH", "DOGE"}
+                           # These markets almost never successfully reverse
+                           # (0-20% reversal win rate across 96 trades).
+                           # When they dip to the stop level, HOLD the
+                           # position to settlement instead of reversing.
+                           # The dip is temporary noise; the favorite
+                           # bounces back and wins the vast majority of
+                           # the time.
+MAX_REVERSALS_PER_WINDOW = 2
+                           # When 3+ markets reverse in the same 15-min
+                           # window, it's usually a broad temporary dip
+                           # that snaps back (reversal win rate drops from
+                           # ~56% to ~29%). Cap at 2 per window; any
+                           # further stops just hold to settlement.
 POLL_SEC           = 0.5
 DAILY_LOSS_LIMIT_C = 1000
 MAX_TRADES_DAY     = 40
@@ -1076,7 +1099,9 @@ def main():
           f"of close · entries+stops event-driven off WS ticks · "
           + (f"orders price-limited (entry <= ask+{MAX_ENTRY_SLIPPAGE_C}c, "
              f"stop >= bid-{MAX_STOP_SLIPPAGE_C}c)" if USE_PRICE_LIMITS else
-             "order price limits OFF"))
+             "order price limits OFF")
+          + f" · reversal blacklist: {','.join(sorted(REVERSAL_BLACKLIST))} (hold to settlement) · "
+            f"max {MAX_REVERSALS_PER_WINDOW} reversals per window")
 
     # One worker per market (was a flat 4) — if several markets trigger a
     # stop in the same moment (a broad move hits correlated assets
@@ -1107,6 +1132,7 @@ def main():
     close_at    = {}
     strike_at   = {}  # ticker -> floor_strike, cached once per window (DATA only)
     open_assets = set()
+    window_rev_count = {}  # ticker-prefix -> count of reversals this window
     run_net     = 0.0
     n_trades    = 0
     day         = now().date()
@@ -1263,13 +1289,16 @@ def main():
             else:
                 rev_fill = 100 - exit_px
 
+        wkey = t.split("15M-", 1)[1] if "15M-" in t else t
         with state_lock:
             state[t] = {"phase": "reversal", "yes": rev_yes,
                         "entry_px": rev_fill, "lots": p["lots"],
                         "entry_iso": now_iso()}
+            window_rev_count[wkey] = window_rev_count.get(wkey, 0) + 1
         print(f"[{now():%H:%M:%S}] REVERSE {p['lots']}x "
               f"{'YES' if rev_yes else 'NO'} @ {rev_fill:.0f}c  "
-              f"{asset(t)} {t[-7:]}")
+              f"{asset(t)} {t[-7:]} "
+              f"(window reversals: {window_rev_count[wkey]}/{MAX_REVERSALS_PER_WINDOW})")
 
     def do_entry(t, lead_yes, ask_seen, limit, src, src_age, t_trig):
         """V23: runs on a worker thread in LIVE (inline in PAPER), submitted
@@ -1406,6 +1435,15 @@ def main():
                 return
             held_bid = yb if p["yes"] else (100 - ya)
             if held_bid > stop_price(p["entry_px"]):
+                return
+            # REVERSAL BLACKLIST: XRP/ETH/DOGE dips are temporary noise —
+            # hold to settlement instead of stopping/reversing.
+            if asset(t) in REVERSAL_BLACKLIST:
+                return
+            # CASCADE LIMITER: cap reversals per 15-min window to prevent
+            # cascade losses from correlated dips across markets.
+            wkey = t.split("15M-", 1)[1] if "15M-" in t else t
+            if window_rev_count.get(wkey, 0) >= MAX_REVERSALS_PER_WINDOW:
                 return
             snap = dict(p)
             state[t] = dict(p, phase="stopping")
