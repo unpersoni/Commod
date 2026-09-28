@@ -1036,7 +1036,7 @@ def start_feed(k):
 
 def main():
     global FEED, SPOT
-    print("Commod15min V25 — starting")
+    print("Commod15min V27 — starting")
     print(f"markets: {', '.join(asset(s) for s in SERIES)}")
     k = load_key(); sess = requests.Session()
     # POOL SIZE: fetch_open() fires one concurrent request per series
