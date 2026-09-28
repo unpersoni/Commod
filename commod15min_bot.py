@@ -428,7 +428,7 @@ except ImportError:
 
 BASE   = "https://api.elections.kalshi.com/trade-api/v2"
 PREF   = "/trade-api/v2"
-WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
+WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 WS_PATH = "/trade-api/ws/v2"
 # Kalshi API key ID — kept out of the (public) repo. Set it in Colab with
 #   os.environ["KALSHI_KEY_ID"] = "..."
