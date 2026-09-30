@@ -1,14 +1,26 @@
 # ============================================================
-# Commod15min V27 — 55-90c entry band, 10c dynamic stop, 60-second
-# window (WTI: 4 minutes). All V23/V24 speed fixes kept; order price
-# limits still OFF.
-#   - Armed for the last 60 seconds of each market (TRIGGER_MIN = 1).
-#     Exception: WTI armed for the last 4 minutes (WTI_TRIGGER_MIN = 4).
-#   - Favorite = first side whose ask is between 55c and 90c (ENTRY_C
-#     to ENTRY_CAP_C). Buy CONTRACTS (10).
-#   - Dynamic stop: Favorite's bid dips 10c below the entry price
-#     (STOP_OFFSET_C = 10) -> one combined order buys 2x (20) of the
-#     opposite side: closes the 10 held + opens 10 new.
+# Commod15min V32 — PAPER mode (LIVE = False).
+#   Built on V31 mechanics. New parameters:
+#     - Entry: first side whose ask is 51-55c (ENTRY_C=51, ENTRY_CAP_C=55).
+#     - Reversal: held favorite's bid dips to 25c (STOP_C=25) -> buy 2x
+#       contracts on the opposite side (~75c), held to settlement.
+#     - Window: last 7 minutes (unchanged from V31).
+#     - Full-window reversal, no-reversal floor, all other mechanics same.
+#   Logs: commod15min_v32_trades.csv, _ticks.csv, _settlements.csv
+#
+# ============================================================
+# Commod15min V29 — V25 (Sep 27) mechanics unchanged; parameters only:
+#   last 7 min, favorite's ask 88-92c, reverse at 70c ONLY in the last 90s
+#   (a dip to 70c earlier than that is ignored — the favorite is held).
+# (V25 header:) back to the 80/70 reversal strategy (parameter tuning
+# comes later). All V23/V24 speed fixes kept; order price limits still OFF.
+#   - Armed for the last 3 minutes of each market (TRIGGER_MIN = 3).
+#   - Favorite = first side to reach 80c (ENTRY_C; 81-82c also buys via
+#     ENTRY_CAP_GRACE_C). Buy CONTRACTS (10).
+#   - Fixed stop: Favorite's bid <= 70c (STOP_C) -> one combined order
+#     buys 2x (20) of the opposite side: closes the 10 held + opens 10 new.
+#     Stop is live the whole time the Favorite is held (STOP_ACTIVATE_SEC
+#     = the full 3-min window), not just the last 90s as in V19-V24.
 #   - Reversal held to settlement. No second stop/reversal.
 #   - Settlement rows now label the 3 outcomes: settle_win (Favorite won),
 #     rev_settle_win (reversal won), rev_settle_loss (reversed, but the
@@ -277,8 +289,9 @@ LIVE     = False  # LIVE TRADING OFF — paused per user request after repeated
                   # data) so analysis work can continue while this is off.
                   # Flip back to True only when explicitly told to.
 PEM_PATH = '/content/drive/MyDrive/intraday key.pem'
-OUT_CSV  = '/content/drive/MyDrive/commod15min_v5.csv'
-TICK_CSV = '/content/drive/MyDrive/commod15min_ticks.csv'
+OUT_CSV    = '/content/drive/MyDrive/commod15min_v32_trades.csv'
+TICK_CSV   = '/content/drive/MyDrive/commod15min_v32_ticks.csv'
+SETTLE_CSV = '/content/drive/MyDrive/commod15min_v32_settlements.csv'
 
 SERIES = [
     "KXBTC15M",
@@ -294,16 +307,24 @@ SERIES = [
     "KXPALLADIUM15M",
 ]
 
-TRIGGER_MIN        = 1.0  # V27: armed for the last 60 seconds of each
-                           # 15-min market. Entry and stop both only
-                           # happen inside this window.
-WTI_TRIGGER_MIN    = 4.0  # V27: WTI gets a wider window (last 4 minutes).
-ENTRY_C            = 55   # V27: the Favorite = the first side whose ask
+TRIGGER_MIN        = 7.0  # V25: armed for the last 3 minutes of each
+                           # 15-min market (i.e. from minute 12 on). Entry
+                           # and stop both only happen inside this window.
+ENTRY_C            = 51   # V32: the Favorite = the first side whose ask
                            # is between ENTRY_C and ENTRY_CAP_C.
-ENTRY_CAP_C        = 90   # V27: upper bound of the entry band.
-STOP_OFFSET_C      = 10   # V27: dynamic stop — reverse when the held
-                           # Favorite's bid dips 10c below entry price.
+ENTRY_CAP_C        = 55   # V32: upper bound of the entry band.
+STOP_C             = 25   # V32: fixed stop. If the held Favorite's bid
+                           # dips to 25c or less, reverse: one combined
+                           # order buys 2x CONTRACTS of the opposite side
+                           # (~75c) — the first 10 close out the Favorite,
+                           # the other 10 are the new reversal position,
+                           # held to settlement. No second stop/reversal.
 CONTRACTS          = 10
+REV_SKIP_BELOW_C   = 20   # no-reversal floor: if the held side's bid is
+                           # already below this when a reversal would fire,
+                           # the Favorite collapsed too fast to reverse at a
+                           # sane price (the other side costs 80c+). Don't
+                           # reverse — hold it to settlement.
 POLL_SEC           = 0.5
 DAILY_LOSS_LIMIT_C = 1000
 MAX_TRADES_DAY     = 40
@@ -320,9 +341,9 @@ STOP_DEADBAND_SEC  = 2.0   # never fire a stop inside this many seconds
                             # A position still open this close just
                             # rides to the real REST settlement result
                             # instead, same as it always has.
-STOP_ACTIVATE_SEC  = TRIGGER_MIN * 60  # V27: stop is live the whole time
+STOP_ACTIVATE_SEC  = 420.0  # V31: reversal armed the whole 7-min window (was 120s). (V25: stop is live the whole time
                             # the Favorite is held (entry and stop share the
-                            # same window). Was 90s in V19-V24:
+                            # same 3-min window). Was 90s in V19-V24:
                             # the stop-loss check doesn't arm until the
                             # window has this many seconds (or fewer) left
                             # to close — i.e. the stop is only "live"
@@ -345,7 +366,10 @@ USE_PRICE_LIMITS     = False  # V24: master switch for the order price
                             # to measure how much the speed fixes alone
                             # close the gap, then flip to True to add the
                             # limits on top.
-ENTRY_CAP_GRACE_C    = 0   # V27: hard cap — band is exactly 55-90c.
+ENTRY_CAP_GRACE_C    = 0   # V24: an ask up to this many cents ABOVE
+                            # ENTRY_CAP_C still triggers the buy, so a
+                            # market that ticks 1-2c past the cap between
+                            # updates isn't a missed trade. 0 = hard cap.
 MAX_ENTRY_SLIPPAGE_C = 2   # V23 (only when USE_PRICE_LIMITS): an entry
                             # order pays at most this many cents above the
                             # ask seen when the trigger fired. If the
@@ -379,6 +403,15 @@ ORDER_RETRY_SEC      = 0.5 # V23: minimum gap between order attempts on
 # for the full Twelve Data/Pyth history if it's ever worth revisiting.
 # ============================================================
 
+
+# ---- crypto spot early reversal ----
+SPOT_REV_ENABLED   = False   # reverse EARLY when spot confirms the favorite is losing
+SPOT_REV_MAX_BID_C = 75      # ...only if the held bid is at or below this
+SPOT_REV_FROM_SEC  = 120.0   # ...only while seconds-to-close is <= this
+SPOT_REV_TO_SEC    = 60.0    # ...and > this (in the last minute Kalshi beats spot)
+SETTLE_RETRY_SEC   = 10.0    # settlement file: re-check an unsettled market this often
+SETTLE_GIVEUP_SEC  = 1800.0  # ...and stop trying after this long
+
 import os, sys, csv, time, math, json, uuid, base64, threading, datetime as dt
 import requests
 from concurrent.futures import ThreadPoolExecutor
@@ -395,30 +428,26 @@ except ImportError:
 
 BASE   = "https://api.elections.kalshi.com/trade-api/v2"
 PREF   = "/trade-api/v2"
-WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
 WS_PATH = "/trade-api/ws/v2"
-# Kalshi API key ID — kept out of the (public) repo. Set it in Colab with
-#   os.environ["KALSHI_KEY_ID"] = "..."
-# before running this cell, or put it alone in a Drive file at KEY_ID_PATH.
-KEY_ID_PATH = '/content/drive/MyDrive/kalshi_key_id.txt'
-KEY_ID = os.environ.get("KALSHI_KEY_ID") or (
-    open(KEY_ID_PATH).read().strip() if os.path.exists(KEY_ID_PATH) else "")
+KEY_ID = "e0d95d64-fa0e-4c9e-be91-35660b0af725"
 COLS   = ["window","mode","side","entry_iso","entry_px",
-          "exit_iso","exit_px","reason","net_c","run_net_c"]
+          "exit_iso","exit_px","reason","net_c","run_net_c",
+          "asset","entry_s2c","exit_s2c","trigger","seen_px","src",
+          "entry_spot","exit_spot","strike"]
+SETTLE_COLS = ["logged_iso","ticker","asset","close_time","result",
+               "floor_strike","expiration_value","status"]
 TICK_COLS = ["ts_iso","ticker","asset","phase","src",
              "yes_bid","yes_ask","yes_mid","sec_to_close",
              "spot_px","floor_strike","pct_from_strike","spot_age"]
 
 def asset(t): return t.split("15M")[0].replace("KX","")
 
-def trigger_min(t):
-    """V27: per-market arm window. WTI gets 4 minutes, everything else 60s."""
-    return WTI_TRIGGER_MIN if asset(t) == "WTI" else TRIGGER_MIN
-
 def stop_price(entry_px):
-    """V27: dynamic stop — reverse when the held Favorite's bid dips
-    STOP_OFFSET_C (10c) below the entry price."""
-    return entry_px - STOP_OFFSET_C
+    """V25: fixed stop level, the same for every entry — the Favorite is
+    reversed once its bid is at or below STOP_C (70c). (V19-V24 used a
+    stop relative to the entry price.)"""
+    return STOP_C
 
 def load_key():
     p = os.path.expanduser(PEM_PATH)
@@ -695,7 +724,6 @@ class PriceFeed:
         self.stop_flag = threading.Event()
         self._next_id = 1
         self.connect_count = 0
-        self._ws_err_count = 0
         self.on_tick = None  # set by main(): called as on_tick(ticker, yes_bid, yes_ask)
                               # the instant a price update lands, for event-driven stops
 
@@ -706,9 +734,9 @@ class PriceFeed:
 
     def _headers(self):
         ts = str(int(time.time()*1000))
-        return {"KALSHI-ACCESS-KEY": KEY_ID,
-                "KALSHI-ACCESS-SIGNATURE": _sign(self.k, ts, 'GET', WS_PATH),
-                "KALSHI-ACCESS-TIMESTAMP": ts}
+        return [f"KALSHI-ACCESS-KEY: {KEY_ID}",
+                f"KALSHI-ACCESS-SIGNATURE: {_sign(self.k, ts, 'GET', WS_PATH)}",
+                f"KALSHI-ACCESS-TIMESTAMP: {ts}"]
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -729,7 +757,6 @@ class PriceFeed:
                 self.ws = ws
                 self.sid = None
                 self.connect_count += 1
-                self._ws_err_count = 0
                 backoff = 1
                 with self.lock:
                     want = set(self.tracked)
@@ -749,11 +776,7 @@ class PriceFeed:
                     if self.ws: self.ws.close()
                 except Exception: pass
                 self.ws = None; self.sid = None
-                self._ws_err_count += 1
-                if self._ws_err_count == 1:
-                    print(f"[ws] disconnected ({e}) — will retry silently")
-                elif self._ws_err_count % 50 == 0:
-                    print(f"[ws] still disconnected after {self._ws_err_count} attempts")
+                print(f"[ws] disconnected ({e}) — reconnecting in {backoff:.0f}s")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30)
 
@@ -1036,7 +1059,7 @@ def start_feed(k):
 
 def main():
     global FEED, SPOT
-    print("Commod15min V27 — starting")
+    print("Commod15min V32 — starting")
     print(f"markets: {', '.join(asset(s) for s in SERIES)}")
     k = load_key(); sess = requests.Session()
     # POOL SIZE: fetch_open() fires one concurrent request per series
@@ -1065,14 +1088,16 @@ def main():
     shard_bal_start = shard_balance(sess, k) if LIVE else None
     print(f"mode={mode}  balance={'$%.2f'%(bal/100) if bal else '—'}"
           f"  shard{DEST_SHARD}={'$%.2f'%(shard_bal_start/100) if shard_bal_start is not None else '—'}")
-    print(f"rules: armed in the last {TRIGGER_MIN*60:.0f}s of each market "
-          f"(WTI: last {WTI_TRIGGER_MIN:.0f}m) · "
-          f"Favorite = first side whose ask is {ENTRY_C}-{ENTRY_CAP_C}c · "
-          f"{CONTRACTS} contracts FOK · "
-          f"dynamic stop: if held favorite dips {STOP_OFFSET_C}c from entry → "
-          f"REVERSE {2*CONTRACTS} opposite · reversal held to settlement, "
+    print(f"rules: armed in the last {TRIGGER_MIN:.0f}m of each market · "
+          f"Favorite = first side whose ask reaches {ENTRY_C}c "
+          f"(buys up to {ENTRY_CAP_C + ENTRY_CAP_GRACE_C}c) · {CONTRACTS} contracts FOK · "
+          f"if its bid dips to {STOP_C}c or less: REVERSE — buy {2*CONTRACTS} of the "
+          f"opposite side in one order (closes the {CONTRACTS} held + opens {CONTRACTS} "
+          f"new), sell+buy fallback if that can't fill · reversal held to settlement, "
           f"no more trading that market · stop off within {STOP_DEADBAND_SEC:.0f}s "
-          f"of close · entries+stops event-driven off WS ticks · "
+          f"of close · reversal armed in the last {STOP_ACTIVATE_SEC:.0f}s · "
+          f"no reversal if bid < {REV_SKIP_BELOW_C}c (hold) · "
+          f"entries+stops event-driven off WS ticks · "
           + (f"orders price-limited (entry <= ask+{MAX_ENTRY_SLIPPAGE_C}c, "
              f"stop >= bid-{MAX_STOP_SLIPPAGE_C}c)" if USE_PRICE_LIMITS else
              "order price limits OFF"))
@@ -1104,14 +1129,41 @@ def main():
 
     state       = {}
     close_at    = {}
-    strike_at   = {}  # ticker -> floor_strike, cached once per window (DATA only)
+    strike_at   = {}  # ticker -> floor_strike, cached once per window
+    settle_due  = {}  # ticker -> [next_check_time, first_seen_closed]
+
+    new_settle_file = not (os.path.exists(SETTLE_CSV) and os.path.getsize(SETTLE_CSV) > 0)
+    sfh = open(SETTLE_CSV, 'a', newline=''); sw = csv.writer(sfh)
+    if new_settle_file: sw.writerow(SETTLE_COLS); sfh.flush()
+
+    def s2c_now(t):
+        ct = close_at.get(t)
+        return None if ct is None else round((ct - now()).total_seconds(), 1)
+
+    def strike_of(t):
+        try: return float(strike_at.get(t))
+        except (TypeError, ValueError): return None
+
+    def spot_now(t):
+        v = spot_lookup(asset(t))
+        return v[0] if v else None
+
+    def spot_rev_ok(t, p, held_bid, s2c):
+        """Crypto early reversal: spot on the losing side of the strike,
+        held bid <= SPOT_REV_MAX_BID_C, between 120s and 60s left."""
+        if not SPOT_REV_ENABLED or asset(t) not in SPOT_ASSET_MAP: return False
+        if not (SPOT_REV_TO_SEC < s2c <= SPOT_REV_FROM_SEC): return False
+        if held_bid > SPOT_REV_MAX_BID_C: return False
+        sp, kx = spot_now(t), strike_of(t)
+        if sp is None or kx is None: return False
+        return (sp > kx) != p["yes"]
     open_assets = set()
     run_net     = 0.0
     n_trades    = 0
     day         = now().date()
     halt        = False
 
-    def record(ticker, reason, entry_px, exit_px, yes_side, lots):
+    def record(ticker, reason, entry_px, exit_px, yes_side, lots, extra=None):
         # Called from the main thread and from worker threads (do_stop) —
         # the whole read-modify-write of run_net/n_trades/state/the CSV
         # writer has to happen as one atomic step. No more post-trade
@@ -1123,10 +1175,15 @@ def main():
             exit_fee  = fee_est(exit_px) * lots if reason in ("stop", "bad-fill") else 0
             net = (exit_px - entry_px) * lots - entry_fee - exit_fee
             run_net += net; n_trades += 1
+            ex = extra or {}
+            pst = state.get(ticker, {})
             w.writerow([ticker, mode, "YES" if yes_side else "NO",
-                        state[ticker].get("entry_iso",""),
+                        pst.get("entry_iso",""),
                         round(entry_px,1), now_iso(), round(exit_px,1),
-                        reason, round(net,1), round(run_net,1)])
+                        reason, round(net,1), round(run_net,1),
+                        asset(ticker), pst.get("entry_s2c"), s2c_now(ticker),
+                        ex.get("trigger", ""), ex.get("seen", ""), ex.get("src", ""),
+                        pst.get("entry_spot"), spot_now(ticker), strike_of(ticker)])
             fh.flush()
             run_net_snapshot = run_net
         print(f"[{now():%H:%M:%S}] {reason.upper()} {lots}x "
@@ -1134,7 +1191,7 @@ def main():
               f"entry={entry_px:.0f} exit={exit_px:.0f} net={net:+.0f}c  "
               f"{asset(ticker)} {ticker[-7:]}  run={run_net_snapshot:+.0f}c")
 
-    def do_stop(t, p, held_bid0):
+    def do_stop(t, p, held_bid0, level=None, why="price"):
         """Runs in a worker thread (submitted by handle_tick), never on
         the WS receive thread or blocking the main loop, so a slow order
         round-trip for one market never delays reacting to ticks for the
@@ -1172,13 +1229,22 @@ def main():
         # about to act (funds check + order round trip take real time) —
         # this was a dip that self-corrected. Put the position back to
         # "long" instead of selling into a bounce.
-        stop_px = stop_price(p["entry_px"])
+        stop_px = level if level is not None else stop_price(p["entry_px"])
         if held_bid > stop_px:
             with state_lock:
                 if state.get(t, {}).get("phase") == "stopping":
                     state[t] = dict(p, phase="long")
             print(f"    (bid recovered to {held_bid:.0f}c before execution "
                   f"— skip, {asset(t)} {t[-7:]})")
+            return
+
+        # NO-REVERSAL FLOOR (re-check on the fresh price read above).
+        if held_bid < REV_SKIP_BELOW_C:
+            with state_lock:
+                if state.get(t, {}).get("phase") == "stopping":
+                    state[t] = dict(p, phase="long", no_rev=True, skip_bid=held_bid)
+            print(f"    (NO REVERSAL — bid already {held_bid:.0f}c < {REV_SKIP_BELOW_C}c, "
+                  f"holding to settlement, {asset(t)} {t[-7:]})")
             return
 
         # V23 PRICE LIMIT: never accept more than MAX_STOP_SLIPPAGE_C
@@ -1231,8 +1297,9 @@ def main():
             else:
                 exit_px = held_bid
 
-        record(t, "stop", p["entry_px"], exit_px, p["yes"], p["lots"])
-        print(f"    (stop level={stop_px:.0f}c, saw bid={held_bid:.0f}c via {src} "
+        record(t, "stop", p["entry_px"], exit_px, p["yes"], p["lots"],
+               extra={"trigger": f"{why}{stop_px:.0f}", "seen": held_bid, "src": src})
+        print(f"    ({why} stop level={stop_px:.0f}c, saw bid={held_bid:.0f}c via {src} "
               f"age {src_age:.2f}s, filled {exit_px:.0f}c "
               f"[{exit_px - stop_px:+.0f}c vs stop], "
               f"{(time.time() - t_trig)*1000:.0f}ms"
@@ -1265,7 +1332,8 @@ def main():
         with state_lock:
             state[t] = {"phase": "reversal", "yes": rev_yes,
                         "entry_px": rev_fill, "lots": p["lots"],
-                        "entry_iso": now_iso()}
+                        "entry_iso": now_iso(), "entry_s2c": s2c_now(t),
+                        "entry_spot": spot_now(t)}
         print(f"[{now():%H:%M:%S}] REVERSE {p['lots']}x "
               f"{'YES' if rev_yes else 'NO'} @ {rev_fill:.0f}c  "
               f"{asset(t)} {t[-7:]}")
@@ -1325,7 +1393,8 @@ def main():
         with state_lock:
             state[t] = {"phase": "long", "yes": lead_yes,
                         "entry_px": fill, "lots": CONTRACTS,
-                        "entry_iso": now_iso()}
+                        "entry_iso": now_iso(), "entry_s2c": s2c_now(t),
+                        "entry_spot": spot_now(t), "entry_src": src}
         print(f"[{now():%H:%M:%S}] BUY {CONTRACTS}x {side} @ {fill:.0f}c  "
               f"{asset(t)} {t[-7:]}  run={run_net:+.0f}c  "
               f"(target {ENTRY_C}c, saw ask {ask_seen:.0f}c via {src} "
@@ -1342,7 +1411,7 @@ def main():
         ct = close_at.get(t)
         if ct is None: return None
         s2c = (ct - now()).total_seconds()
-        if s2c <= 0 or s2c > trigger_min(t) * 60: return None
+        if s2c <= 0 or s2c > TRIGGER_MIN * 60: return None
         if asset(t) in open_assets: return None
         # favorite = side with the higher mid; the band is checked on its
         # ASK — the price a buy actually pays — not on mid
@@ -1380,6 +1449,8 @@ def main():
             p = state.get(t)
             if not p or p.get("phase") != "long":
                 return
+            if p.get("no_rev"):
+                return
             if time.time() < p.get("retry_after", 0):
                 return
             # STOP ARM WINDOW: the stop only watches while
@@ -1401,10 +1472,19 @@ def main():
             if ct is None:
                 return
             s2c = (ct - now()).total_seconds()
-            if s2c <= STOP_DEADBAND_SEC or s2c > trigger_min(t) * 60:
+            if s2c <= STOP_DEADBAND_SEC or s2c > STOP_ACTIVATE_SEC:
                 return
             held_bid = yb if p["yes"] else (100 - ya)
-            if held_bid > stop_price(p["entry_px"]):
+            level, why = stop_price(p["entry_px"]), "price"
+            if held_bid > level:
+                if not spot_rev_ok(t, p, held_bid, s2c):
+                    return
+                level, why = SPOT_REV_MAX_BID_C, "spot"
+            if held_bid < REV_SKIP_BELOW_C:
+                state[t] = dict(p, no_rev=True, skip_bid=held_bid)
+                print(f"[{now():%H:%M:%S}] NO REVERSAL — bid already {held_bid:.0f}c "
+                      f"(< {REV_SKIP_BELOW_C}c), holding to settlement  "
+                      f"{asset(t)} {t[-7:]}  {s2c:.0f}s left")
                 return
             snap = dict(p)
             state[t] = dict(p, phase="stopping")
@@ -1413,7 +1493,7 @@ def main():
             # (place_order etc.) — hand it to a worker thread so a slow
             # order round trip for one market never delays reacting to
             # ticks for the others.
-            order_executor.submit(do_stop, t, snap, held_bid)
+            order_executor.submit(do_stop, t, snap, held_bid, level, why)
         else:
             # PAPER mode: do_stop is pure local state/logging, no network
             # I/O at all — handing it to the worker pool just adds
@@ -1421,7 +1501,7 @@ def main():
             # which is pure slippage with no upside. Run it synchronously
             # instead so that re-read happens essentially instantly after
             # the trigger tick.
-            do_stop(t, snap, held_bid)
+            do_stop(t, snap, held_bid, level, why)
 
     FEED.on_tick = handle_tick
 
@@ -1467,6 +1547,27 @@ def main():
                 close_at.setdefault(t, parse_iso(m.get("close_time")))
                 strike_at.setdefault(t, m.get("floor_strike"))
                 state.setdefault(t, {"phase": "watch"})
+                settle_due.setdefault(t, [0.0, None])
+
+            # DATA: official result for EVERY market (traded or not);
+            # at most 4 lookups per loop so a window rollover stays cheap
+            n_lookups = 0
+            for t in list(settle_due):
+                if t in live or n_lookups >= 4: continue
+                due = settle_due[t]
+                if due[1] is None: due[1] = time.time()
+                if time.time() < due[0]: continue
+                if time.time() - due[1] > SETTLE_GIVEUP_SEC:
+                    del settle_due[t]; continue
+                mk = fetch_market(sess, k, t); n_lookups += 1
+                if mk.get("status") in ("finalized", "settled") and mk.get("result"):
+                    sw.writerow([now_iso(), t, asset(t), mk.get("close_time"), mk.get("result"),
+                                 mk.get("floor_strike"), mk.get("expiration_value"),
+                                 mk.get("status")])
+                    sfh.flush()
+                    del settle_due[t]
+                else:
+                    due[0] = time.time() + SETTLE_RETRY_SEC
 
             # settle closed positions
             for t, p in list(state.items()):
@@ -1489,13 +1590,18 @@ def main():
                               ("settle_win" if won else "settle_loss"))
                     record(t, reason,
                            p["entry_px"], 100 if won else 0,
-                           p["yes"], p["lots"])
+                           p["yes"], p["lots"],
+                           extra=({"trigger": f"skip<{REV_SKIP_BELOW_C}",
+                                   "seen": p.get("skip_bid")}
+                                  if p.get("no_rev") else None))
                     print("    outcome: " + {
                         "settle_win": "1 — Favorite won",
                         "rev_settle_win": "2 — reversal won",
                         "rev_settle_loss": "3 — Favorite won after being reversed out",
                         "settle_loss": "Favorite lost (stop never triggered)",
-                    }[reason] + f"  {asset(t)} {t[-7:]}")
+                    }[reason] + (" (reversal skipped: bid was below the floor)"
+                                   if p.get("no_rev") else "")
+                                + f"  {asset(t)} {t[-7:]}")
                     open_assets.discard(asset(t))
                     state[t] = {"phase": "done"}
 
@@ -1505,7 +1611,6 @@ def main():
                 if ct is None: continue
                 s2c = (ct - now()).total_seconds()
                 if s2c <= 0: continue
-                if s2c > trigger_min(t) * 60: continue  # outside the watch window
 
                 # SPEED: prefer the WS feed's price — pushed the instant it
                 # changes — over the REST batch snapshot, which can only be
@@ -1550,6 +1655,8 @@ def main():
                 if tick_rows_since_flush >= 20:
                     tfh.flush(); tick_rows_since_flush = 0
 
+                # log the whole market (above); trade only inside the armed window
+                if s2c > TRIGGER_MIN * 60: continue
                 if p["phase"] == "done": continue  # logged above; nothing more to act on
 
                 # ── WATCH -> ARMED: status line only. V23: no `continue`
@@ -1593,5 +1700,6 @@ def main():
     order_executor.shutdown(wait=True)
     fh.flush(); fh.close()
     tfh.flush(); tfh.close()
+    sfh.flush(); sfh.close()
     print(f"[stopped] trades={n_trades} net={run_net:+.0f}c")
 
